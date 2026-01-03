@@ -43,7 +43,7 @@ export default function LoginScreen() {
         setLoading(true)
         
         const { data, error } = await supabase.auth.signUp({
-            email: email,
+            email: email.trim(),
             password: password,
         })
 
