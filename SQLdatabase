@@ -1,0 +1,113 @@
+-- database/schema.sql
+
+-- 1. Profiles 表 (使用者資料)
+create table if not exists public.profiles (
+  id uuid references auth.users on delete cascade not null primary key,
+  username text,
+  avatar_url text,
+  bio text
+);
+alter table public.profiles enable row level security;
+create policy "Public profiles are viewable by everyone." on profiles for select using (true);
+create policy "Users can insert their own profile." on profiles for insert with check (auth.uid() = id);
+create policy "Users can update own profile." on profiles for update using (auth.uid() = id);
+
+-- 2. Swipes 表 (滑動紀錄)
+create table if not exists public.swipes (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users not null,
+  target_id uuid references auth.users not null,
+  is_like boolean not null,
+  created_at timestamp with time zone default now(),
+  unique(user_id, target_id)
+);
+alter table public.swipes enable row level security;
+create policy "Users can insert their own swipes" on public.swipes for insert with check (auth.uid() = user_id);
+create policy "Users can view their own swipes" on public.swipes for select using (auth.uid() = user_id);
+
+-- 3. Matches 表 (配對成功)
+create table if not exists public.matches (
+  id uuid default gen_random_uuid() primary key,
+  user1_id uuid references auth.users not null,
+  user2_id uuid references auth.users not null,
+  created_at timestamp with time zone default now(),
+  unique(user1_id, user2_id)
+);
+alter table public.matches enable row level security;
+create policy "Users can view their own matches" on public.matches for select using (auth.uid() = user1_id or auth.uid() = user2_id);
+
+-- 4. Messages 表 (聊天訊息 - 最新版)
+-- 注意：這裡我們確保 receiver_id 存在
+create table public.messages (
+  id uuid default gen_random_uuid() primary key,
+  content text not null,
+  sender_id uuid references auth.users not null,
+  receiver_id uuid references auth.users not null, -- 關鍵欄位
+  created_at timestamp with time zone default now()
+);
+alter publication supabase_realtime add table public.messages; -- 開啟即時監聽
+alter table public.messages enable row level security;
+create policy "Users can view their own messages" on public.messages for select using (auth.uid() = sender_id or auth.uid() = receiver_id);
+create policy "Users can insert messages" on public.messages for insert with check (auth.uid() = sender_id);
+
+// 建立 profile_photos 資料表 (SQL)
+-- 1. 建立 profile_photos 資料表
+create table if not exists public.profile_photos (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users not null,
+  url text not null,
+  rank integer default 0, -- 0=大頭貼, 1=第二張...
+  created_at timestamp with time zone default now()
+);
+
+-- 2. 開啟安全性 (RLS)
+alter table public.profile_photos enable row level security;
+
+-- 3. 設定權限：使用者可以看所有人的照片
+create policy "Public photos are viewable by everyone"
+  on profile_photos for select
+  using ( true );
+
+-- 4. 設定權限：使用者只能新增/修改/刪除自己的照片
+create policy "Users can insert their own photos"
+  on profile_photos for insert
+  with check ( auth.uid() = user_id );
+
+create policy "Users can update their own photos"
+  on profile_photos for update
+  using ( auth.uid() = user_id );
+
+create policy "Users can delete their own photos"
+  on profile_photos for delete
+  using ( auth.uid() = user_id );
+
+// 建立「自動同步大頭貼」的機制 (關鍵魔法)
+-- 1. 建立一個函數：自動更新大頭貼
+create or replace function public.sync_avatar_from_photos()
+returns trigger as $$
+declare
+  first_photo_url text;
+begin
+  -- 找出該使用者排序第一 (rank=0) 的照片
+  -- 如果沒有 rank=0，就找 rank 最小的那張
+  select url into first_photo_url
+  from public.profile_photos
+  where user_id = NEW.user_id
+  order by rank asc
+  limit 1;
+
+  -- 如果有找到照片，就更新到 profiles 表
+  if first_photo_url is not null then
+    update public.profiles
+    set avatar_url = first_photo_url
+    where id = NEW.user_id;
+  end if;
+
+  return NEW;
+end;
+$$ language plpgsql security definer;
+
+-- 2. 建立觸發器 (Trigger)：當照片新增/修改/刪除時，執行上面的函數
+create trigger on_photo_change
+  after insert or update or delete on public.profile_photos
+  for each row execute procedure public.sync_avatar_from_photos();
